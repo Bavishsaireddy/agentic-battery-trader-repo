@@ -193,7 +193,7 @@ sequenceDiagram
             Wrt-->>Orch: revised draft report
             deactivate Wrt
         else avg_score >= 7.5
-            break loop
+            Note right of Orch: Break loop
         end
     end
     
