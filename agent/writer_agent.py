@@ -1,125 +1,63 @@
-"""
-Writer Agent — Markdown report formatting.
-
-Responsibilities:
-  - Receives merged findings JSON from the Orchestrator (analyst + market data).
-  - Makes a single LLM call with no tools — pure text generation.
-  - Produces a structured Markdown report following the output format in
-    WRITER_SYSTEM_PROMPT.
-  - Can also handle revision requests from the Critic Agent (second call).
-
-Design note: The Writer never calls tools and never sees the raw DataFrame.
-It can only write what it was given in the findings JSON, which is the primary
-hallucination-prevention mechanism in the multi-agent pipeline.
-"""
-
-from __future__ import annotations
-
 import json
+import logging
 
-from agent.agent import _make_openai_client
-from agent.prompts import WRITER_SYSTEM_PROMPT, WRITER_USER_TEMPLATE, WRITER_REVISION_TEMPLATE
+from openai import AsyncOpenAI
+import anthropic
 
+from config import LLM_PROVIDER, LLM_MODEL, LLM_TEMPERATURE, OPENAI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY
+from prompts.report import REPORT_SYSTEM_PROMPT, REPORT_USER_PROMPT
 
-def _call_llm(client, model: str, system: str, user: str) -> str:
-    """Single LLM call — no tools."""
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.2,
-    )
-    return response.choices[0].message.content or ""
+logger = logging.getLogger(__name__)
 
+class WriterAgent:
+    """Formats the JSON findings dict and optional critic feedback into Markdown report."""
+    def __init__(self, findings: dict, feedback: str = ""):
+        self.findings = findings
+        self.feedback = feedback
+        
+    async def run(self) -> str:
+        findings_str = json.dumps(self.findings, indent=2)
+        feedback_str = f"CRITIC FEEDBACK TO INCORPORATE:\n{self.feedback}" if self.feedback else ""
+        
+        system_prompt = REPORT_SYSTEM_PROMPT
+        user_prompt = REPORT_USER_PROMPT.format(analysis=findings_str, feedback=feedback_str)
+        
+        logger.info("Calling LLM (%s:%s) for final report draft...", LLM_PROVIDER, LLM_MODEL)
+        
+        if LLM_PROVIDER == "openai" or LLM_PROVIDER == "groq" or LLM_PROVIDER == "openrouter":
+            base_url = None
+            api_key = OPENAI_API_KEY
+            if LLM_PROVIDER == "groq":
+                base_url = "https://api.groq.com/openai/v1"
+                api_key = GROQ_API_KEY
+            elif LLM_PROVIDER == "openrouter":
+                base_url = "https://openrouter.ai/api/v1"
+                api_key = OPENROUTER_API_KEY
+                
+            client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            response = await client.chat.completions.create(
+                model=LLM_MODEL,
+                temperature=LLM_TEMPERATURE,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+            content = response.choices[0].message.content
+            
+        elif LLM_PROVIDER == "anthropic":
+            client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+            response = await client.messages.create(
+                model=LLM_MODEL,
+                temperature=LLM_TEMPERATURE,
+                max_tokens=4096,
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+            content = response.content[0].text
+        else:
+            raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
 
-def _findings_to_str(findings: dict) -> str:
-    """Serialise a findings dict to a compact JSON string for the prompt."""
-    return json.dumps(findings, indent=2, default=str)
-
-
-def write_report(
-    analyst_findings: dict,
-    market_findings: dict,
-    battery_id: str,
-    date: str,
-    verbose: bool = True,
-) -> str:
-    """Generate the initial Markdown report from analyst and market findings.
-
-    Parameters
-    ----------
-    analyst_findings  : Dict returned by analyst_agent.run_analyst().
-    market_findings   : Dict returned by market_agent.run_market().
-    battery_id        : Battery identifier for report header.
-    date              : Date string for report header.
-    verbose           : Print progress.
-
-    Returns
-    -------
-    Markdown report string.
-    """
-    client, model, _cfg = _make_openai_client("writer")
-
-    if verbose:
-        print("  [Writer] Composing report from findings...")
-
-    user_message = WRITER_USER_TEMPLATE.format(
-        battery_id=battery_id,
-        date=date,
-        analyst_findings=_findings_to_str(analyst_findings),
-        market_findings=_findings_to_str(market_findings),
-    )
-
-    report = _call_llm(client, model, WRITER_SYSTEM_PROMPT, user_message)
-
-    if verbose:
-        print(f"  [Writer] Report drafted ({len(report)} chars).\n")
-
-    return report
-
-
-def revise_report(
-    draft: str,
-    revision_request: str,
-    analyst_findings: dict,
-    market_findings: dict,
-    battery_id: str,
-    date: str,
-    verbose: bool = True,
-) -> str:
-    """Revise a draft report based on Critic Agent feedback.
-
-    Parameters
-    ----------
-    draft             : The previous draft report to revise.
-    revision_request  : Specific issues and instructions from the Critic.
-    analyst_findings  : Analyst findings dict (for number verification).
-    market_findings   : Market findings dict.
-    battery_id        : Battery identifier.
-    date              : Date string.
-    verbose           : Print progress.
-
-    Returns
-    -------
-    Revised Markdown report string.
-    """
-    client, model, _cfg = _make_openai_client("writer")
-
-    if verbose:
-        print("  [Writer] Revising report based on Critic feedback...")
-
-    user_message = WRITER_REVISION_TEMPLATE.format(
-        draft=draft,
-        revision_request=revision_request,
-        analyst_findings=_findings_to_str(analyst_findings),
-        market_findings=_findings_to_str(market_findings),
-    )
-
-    revised = _call_llm(client, model, WRITER_SYSTEM_PROMPT, user_message)
-
-    if verbose:
-        print(f"  [Writer] Revision complete ({len(revised)} chars).\n")
-
-    return revised
+        return content

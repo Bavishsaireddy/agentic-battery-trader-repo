@@ -1,286 +1,78 @@
-"""
-Orchestrator — coordinates the 4-agent battery analysis pipeline.
-
-Pipeline flow:
-  1. [Parallel]  Analyst Agent + Market Agent run concurrently via asyncio.
-  2. [Sequential] Writer Agent produces a Markdown report from merged findings.
-  3. [Loop]      Critic Agent evaluates the report; requests revision if score < threshold.
-                 Writer revises. Repeat up to max_revisions times.
-  4. Return PipelineResult with final report + all metadata.
-
-Usage:
-    import asyncio
-    from agent.orchestrator import run_pipeline
-    result = asyncio.run(run_pipeline(df, battery_id="BLYTHB1", date="2026-01-26"))
-    print(result.report)
-
-Or synchronously from a non-async context:
-    from agent.orchestrator import run_pipeline_sync
-    result = run_pipeline_sync(df, battery_id="BLYTHB1", date="2026-01-26")
-"""
-
-from __future__ import annotations
-
 import asyncio
-from dataclasses import dataclass, field
-from datetime import datetime
-
+import logging
 import pandas as pd
 
-from agent.analyst_agent import run_analyst, AnalystResult
-from agent.market_agent import run_market, MarketResult
-from agent.writer_agent import write_report, revise_report
-from agent.critic_agent import evaluate_report, CriticResult
+from agent.anomaly_agent import AnomalyAgent
+from agent.analyst_agent import AnalystAgent
+from agent.market_agent import MarketAgent
+from agent.economics_agent import EconomicsAgent
+from agent.writer_agent import WriterAgent
+from agent.critic_agents import QuantCritic, StrategyCritic
 
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Pipeline return type
-# ---------------------------------------------------------------------------
-
-@dataclass
 class PipelineResult:
-    """Complete result of the multi-agent analysis pipeline.
+    def __init__(self, report: str, eval_score: float, revision_count: int):
+        self.report = report
+        self.eval_score = eval_score
+        self.revision_count = revision_count
 
-    Attributes
-    ----------
-    report                : Final approved Markdown report.
-    analyst_findings      : Structured findings dict from the Analyst Agent.
-    market_findings       : Structured findings dict from the Market Agent.
-    analyst_tool_calls    : Ordered tool call trace from the Analyst Agent.
-    market_tool_calls     : Ordered tool call trace from the Market Agent.
-    revision_count        : Number of Writer revisions triggered by the Critic.
-    eval_score            : Final Critic average score (0–10).
-    eval_details          : Per-dimension scores and grounding check results.
-    critic_decision       : "APPROVE" or "REVISE" (final Critic decision).
-    elapsed_seconds       : Wall-clock time for the full pipeline.
-    """
-
-    report: str
-    analyst_findings: dict
-    market_findings: dict
-    analyst_tool_calls: list[dict] = field(default_factory=list)
-    market_tool_calls: list[dict] = field(default_factory=list)
-    revision_count: int = 0
-    eval_score: float = 0.0
-    eval_details: dict = field(default_factory=dict)
-    critic_decision: str = "APPROVE"
-    elapsed_seconds: float = 0.0
-
-    @property
-    def all_tool_calls(self) -> list[dict]:
-        """Combined tool call trace from both specialist agents."""
-        return self.analyst_tool_calls + self.market_tool_calls
-
-
-# ---------------------------------------------------------------------------
-# Async pipeline
-# ---------------------------------------------------------------------------
-
-async def run_pipeline(
-    df: pd.DataFrame,
-    battery_id: str,
-    date: str,
-    max_revisions: int = 2,
-    approval_threshold: float = 7.5,
-    verbose: bool = True,
-) -> PipelineResult:
-    """Run the full 4-agent pipeline asynchronously.
-
-    Parameters
-    ----------
-    df                  : Validated DataFrame from load_and_validate().
-    battery_id          : Battery identifier string.
-    date                : Analysis date string.
-    max_revisions       : Maximum Writer revisions the Critic can trigger.
-    approval_threshold  : Minimum average score (0–10) for Critic approval.
-    verbose             : Print per-agent progress traces.
-
-    Returns
-    -------
-    PipelineResult with final report and full execution metadata.
-    """
-    start_time = datetime.now()
-
-    if verbose:
-        print(f"\n{'='*64}")
-        print(f"  Battery Decision Support Agent  —  Multi-Agent Pipeline")
-        print(f"  Asset: {battery_id}  |  Date: {date}")
-        print(f"  Agents: Orchestrator → [Analyst ∥ Market] → Writer → Critic")
-        print(f"{'='*64}\n")
-
-    # ------------------------------------------------------------------ #
-    # Step 1: Run Analyst + Market agents concurrently                    #
-    # ------------------------------------------------------------------ #
-
-    if verbose:
-        print("  [Orchestrator] Launching Analyst and Market agents in parallel...\n")
-
-    loop = asyncio.get_event_loop()
-
-    phase1_start = datetime.now()
-    analyst_task = loop.run_in_executor(
-        None,
-        lambda: run_analyst(df=df, battery_id=battery_id, date=date, verbose=verbose),
-    )
-    market_task = loop.run_in_executor(
-        None,
-        lambda: run_market(df=df, battery_id=battery_id, date=date, verbose=verbose),
-    )
-
-    analyst_result: AnalystResult
-    market_result: MarketResult
-    analyst_result, market_result = await asyncio.gather(analyst_task, market_task)
-    phase1_elapsed = (datetime.now() - phase1_start).total_seconds()
-
-    if verbose:
-        print(
-            f"  [Orchestrator] Analyst done ({len(analyst_result.tool_calls)} tool calls) | "
-            f"Market done ({len(market_result.tool_calls)} tool calls) | "
-            f"Phase 1 elapsed: {phase1_elapsed:.1f}s\n"
-        )
-
-    analyst_findings = analyst_result.findings
-    market_findings = market_result.findings
-
-    # ------------------------------------------------------------------ #
-    # Step 2: Writer produces initial draft                               #
-    # ------------------------------------------------------------------ #
-
-    if verbose:
-        print("  [Orchestrator] Passing merged findings to Writer Agent...\n")
-
-    phase2_start = datetime.now()
-    draft = write_report(
-        analyst_findings=analyst_findings,
-        market_findings=market_findings,
-        battery_id=battery_id,
-        date=date,
-        verbose=verbose,
-    )
-
-    phase2_elapsed = (datetime.now() - phase2_start).total_seconds()
-    if verbose:
-        print(f"  [Orchestrator] Writer phase elapsed: {phase2_elapsed:.1f}s\n")
-
-    # ------------------------------------------------------------------ #
-    # Step 3: Critic revision loop                                        #
-    # ------------------------------------------------------------------ #
-
-    revision_count = 0
-    critic_result: CriticResult | None = None
-
-    for attempt in range(max_revisions + 1):
-        if verbose:
-            iter_label = f"attempt {attempt + 1}/{max_revisions + 1}"
-            print(f"  [Orchestrator] Sending draft to Critic Agent ({iter_label})...\n")
-
-        critic_result = evaluate_report(
-            report_text=draft,
-            analyst_findings=analyst_findings,
-            market_findings=market_findings,
-            approval_threshold=approval_threshold,
-            verbose=verbose,
-        )
-
-        if critic_result.approved:
-            if verbose:
-                print(f"  [Orchestrator] Critic APPROVED after {revision_count} revision(s).\n")
-            break
-
-        if attempt < max_revisions:
+class Orchestrator:
+    """Executes the pipeline completely in parallel via asyncio."""
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+        
+    async def run_pipeline_sync(self) -> PipelineResult:
+        # 1. Pre-Flight Check (Synchronous execution)
+        anomaly = AnomalyAgent(self.df)
+        anomaly_findings = anomaly.check_anomalies()
+        
+        # 2. Parallel Metrics Launch
+        logger.info("Orchestrator: Launching Analyst, Market, and Economics agents in parallel...")
+        analyst = AnalystAgent(self.df)
+        market = MarketAgent(self.df)
+        economics = EconomicsAgent(self.df)
+        
+        a_task = asyncio.create_task(analyst.run())
+        m_task = asyncio.create_task(market.run())
+        e_task = asyncio.create_task(economics.run())
+        
+        analyst_out, market_out, economics_out = await asyncio.gather(a_task, m_task, e_task)
+        
+        logger.info("Orchestrator: Merging findings...")
+        merged_findings = {**analyst_out, **market_out, **economics_out, "anomaly_checks": anomaly_findings}
+        
+        logger.info("Orchestrator: Awaiting WriterAgent generation...")
+        writer = WriterAgent(merged_findings)
+        draft = await writer.run()
+        
+        revision_count = 0
+        final_score = 0.0
+        
+        logger.info("Orchestrator: Entering Dual Critic Loop...")
+        for i in range(2):
+            q_critic = QuantCritic(merged_findings, draft)
+            s_critic = StrategyCritic(merged_findings, draft)
+            
+            logger.info("Critic pass %d: Awaiting Quant and Strategy eval...", i+1)
+            q_task = asyncio.create_task(q_critic.evaluate())
+            s_task = asyncio.create_task(s_critic.evaluate())
+            
+            (q_score, q_feed), (s_score, s_feed) = await asyncio.gather(q_task, s_task)
+            
+            avg_score = (q_score + s_score) / 2
+            final_score = avg_score
+            logger.info("  -> Quant Score=%.2f | Strategy Score=%.2f | Avg=%.2f", q_score, s_score, avg_score)
+            
+            if avg_score >= 7.5:
+                logger.info("Draft unconditionally approved by Dual Critics.")
+                break
+                
+            logger.info("Score below 7.5. Aggregating feedback and requesting Writer revision...")
+            combined_feedback = f"[QUANT FEEDBACK]: {q_feed}\n[STRATEGY FEEDBACK]: {s_feed}"
             revision_count += 1
-            if verbose:
-                print(
-                    f"  [Orchestrator] Critic requested revision {revision_count}. "
-                    f"Sending to Writer...\n"
-                )
-            draft = revise_report(
-                draft=draft,
-                revision_request=critic_result.revision_request,
-                analyst_findings=analyst_findings,
-                market_findings=market_findings,
-                battery_id=battery_id,
-                date=date,
-                verbose=verbose,
-            )
-        else:
-            if verbose:
-                print(
-                    f"  [Orchestrator] Max revisions ({max_revisions}) reached. "
-                    f"Accepting best draft.\n"
-                )
-            break
-
-    elapsed = (datetime.now() - start_time).total_seconds()
-
-    if verbose:
-        score = critic_result.average_score if critic_result else 0.0
-        print(f"{'='*64}")
-        print(f"  Pipeline complete in {elapsed:.1f}s")
-        print(
-            f"  Revisions: {revision_count}  |  "
-            f"Eval score: {score:.1f}/10  |  "
-            f"Tool calls: {len(analyst_result.tool_calls) + len(market_result.tool_calls)}"
-        )
-        print(f"{'='*64}\n")
-
-    eval_details: dict = {}
-    if critic_result:
-        eval_details = {
-            "recommendation_specificity": critic_result.recommendation_specificity,
-            "driver_accuracy": critic_result.driver_accuracy,
-            "trader_usefulness": critic_result.trader_usefulness,
-            "grounding_issues": critic_result.grounding_issues,
-            "grounding_verified": critic_result.grounding_verified,
-            "summary": critic_result.summary,
-        }
-
-    return PipelineResult(
-        report=draft,
-        analyst_findings=analyst_findings,
-        market_findings=market_findings,
-        analyst_tool_calls=analyst_result.tool_calls,
-        market_tool_calls=market_result.tool_calls,
-        revision_count=revision_count,
-        eval_score=critic_result.average_score if critic_result else 0.0,
-        eval_details=eval_details,
-        critic_decision=critic_result.decision if critic_result else "APPROVE",
-        elapsed_seconds=elapsed,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Synchronous convenience wrapper
-# ---------------------------------------------------------------------------
-
-def run_pipeline_sync(
-    df: pd.DataFrame,
-    battery_id: str,
-    date: str,
-    max_revisions: int = 2,
-    approval_threshold: float = 7.5,
-    verbose: bool = True,
-) -> PipelineResult:
-    """Synchronous wrapper around run_pipeline() for use in non-async contexts.
-
-    Equivalent to asyncio.run(run_pipeline(...)) but handles the case where
-    an event loop is already running (e.g. in Jupyter notebooks).
-    """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        # Running inside an existing event loop (e.g. Jupyter)
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(
-                asyncio.run,
-                run_pipeline(df, battery_id, date, max_revisions, approval_threshold, verbose),
-            )
-            return future.result()
-    else:
-        return asyncio.run(
-            run_pipeline(df, battery_id, date, max_revisions, approval_threshold, verbose)
-        )
+            writer = WriterAgent(merged_findings, combined_feedback)
+            draft = await writer.run()
+            
+        logger.info("Orchestrator sequence complete.")
+        return PipelineResult(report=draft, eval_score=final_score, revision_count=revision_count)
